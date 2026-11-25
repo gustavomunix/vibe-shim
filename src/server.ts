@@ -38,6 +38,16 @@ interface ToolMapping {
   reverseNames: Map<string, string>; // sanitized name -> original OpenAI tool name
 }
 
+// Direct names the engine refuses for caller tools ("conflicts with a built-in
+// tool"). The engine's list depends on its config, so names it rejects at run
+// time are learned and renamed on the retry.
+const reservedToolNames = new Set([
+  "bash", "edit", "read", "write", "read_file", "write_file", "search_replace",
+  "grep", "glob", "ls", "skill", "sleep", "wait", "task", "todo", "web_fetch",
+  "web_search", "ask_user_question", "sign_in",
+]);
+const CONFLICT_RE = /direct tool name "([^"]+)" conflicts with a built-in tool/;
+
 function sanitizeToolName(name: string): string {
   let clean = name.replace(/[^A-Za-z0-9_$]/g, "_");
   if (!clean) clean = "_";
@@ -64,7 +74,8 @@ function mapOpenAITools(tools: OpenAITool[] | undefined, toolChoice: unknown): T
     if (t?.type && t.type !== "function") continue;
     const origName = t?.function?.name;
     if (!origName || typeof origName !== "string") continue;
-    const base = sanitizeToolName(origName);
+    let base = sanitizeToolName(origName);
+    if (reservedToolNames.has(base)) base = `client_${base}`;
     let safeName = base;
     let suffix = 2;
     while (used.has(safeName)) {
@@ -321,7 +332,9 @@ export function createShimServer(
         agentSocket: socket.socketPath,
         outputDir,
         autoApprove: true,
-        enabledTools: [],
+        // An empty list means "no filter" in the engine; a pattern that matches
+        // nothing is what actually switches its own tools off.
+        enabledTools: ["__vibe_shim_none__"],
         ...(Object.keys(config).length ? { config } : {}),
       });
       endedPromise = launched.ended;
@@ -435,6 +448,13 @@ export function createShimServer(
       throw new Error(`vibe run: ${message}`);
     } catch (err) {
       await abortRun(run, err instanceof Error ? err.message : "run failed");
+      const conflict = err instanceof Error ? CONFLICT_RE.exec(err.message) : null;
+      if (conflict && !match && !reservedToolNames.has(conflict[1])) {
+        reservedToolNames.add(conflict[1]);
+        opts.log(`tool name "${conflict[1]}" is reserved by the engine; retrying renamed`);
+        res.off("close", onClientClose);
+        return runCompletion(body, res);
+      }
       throw err;
     } finally {
       res.off("close", onClientClose);
