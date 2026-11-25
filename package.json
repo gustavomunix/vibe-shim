@@ -1,0 +1,23 @@
+{
+  "name": "vibe-shim",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Neutral OpenAI-compatible proxy that exposes a Mistral Vibe plan (vibe engine in programmatic mode) to any client that reads OpenAI-style endpoints.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "serve": "node dist/cli.js serve",
+    "status": "node dist/cli.js status"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gustavomunix/vibe-shim.git"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.10",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

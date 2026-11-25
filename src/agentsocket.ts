@@ -1,0 +1,181 @@
+import net from "node:net";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdirSync, chmodSync } from "node:fs";
+import { dirname } from "node:path";
+
+/** Resolve a Python >= 3.9 interpreter for Vibe's tool helper. */
+function resolvePython(): string {
+  const override = process.env.VIBE_SHIM_PYTHON;
+  if (override) return override;
+  for (const bin of ["python3", "python", "/usr/bin/python3"]) {
+    try {
+      const probe = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: 5000 });
+      if (probe.status === 0) return bin;
+    } catch {
+      /* try next */
+    }
+  }
+  return "python3";
+}
+
+/**
+ * The agent socket the vibe engine connects to for every run. Serves a
+ * passthrough sandbox (vibe's own tools run on this host, like the CLI) and,
+ * later, the caller's tools via tools/call. One connection per request: one
+ * line in, one line out, compact JSON-RPC with camelCase fields.
+ */
+export class AgentSocketServer {
+  private server: net.Server | null = null;
+
+  constructor(
+    private readonly socketPath: string,
+    private readonly workspace: string,
+    private readonly log: (line: string) => void,
+    private readonly python: string = resolvePython(),
+  ) {}
+
+  listen(): Promise<string> {
+    mkdirSync(dirname(this.socketPath), { recursive: true });
+    chmodSync(dirname(this.socketPath), 0o700);
+    const server = net.createServer({ allowHalfOpen: true }, (conn) =>
+      this.handle(conn),
+    );
+    this.server = server;
+    return new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(this.socketPath, () => {
+        chmodSync(this.socketPath, 0o600);
+        resolve(this.socketPath);
+      });
+    });
+  }
+
+  async close(): Promise<void> {
+    const server = this.server;
+    if (!server) return;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    this.server = null;
+  }
+
+  private reply(conn: net.Socket, id: unknown, result?: unknown, error?: unknown): void {
+    const msg: Record<string, unknown> = { jsonrpc: "2.0", id };
+    if (error !== undefined) msg.error = error;
+    else msg.result = result ?? {};
+    conn.write(JSON.stringify(msg) + "\n");
+    conn.end();
+  }
+
+  private handle(conn: net.Socket): void {
+    conn.setEncoding("utf8");
+    let buf = "";
+    conn.on("data", (chunk: string) => {
+      buf += chunk;
+      let idx: number;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, idx);
+        buf = buf.slice(idx + 1);
+        if (!line.trim()) continue;
+        let req: any;
+        try {
+          req = JSON.parse(line);
+        } catch {
+          this.reply(conn, null, undefined, { code: -32700, message: "parse error" });
+          continue;
+        }
+        this.dispatch(conn, req).catch((err: Error) => {
+          this.reply(conn, req.id, undefined, { code: -32000, message: err.message });
+        });
+      }
+    });
+    conn.on("error", () => conn.destroy());
+  }
+
+  private async dispatch(conn: net.Socket, req: any): Promise<void> {
+    const { method, params, id } = req;
+    switch (method) {
+      case "agent/initialize":
+        this.reply(conn, id, {
+          protocolVersion: 2,
+          workspace: this.workspace,
+          python: this.python,
+        });
+        return;
+      case "sandbox/execute": {
+        const { command, cwd, timeout } = params;
+        this.log(`sandbox/execute: ${String(command).slice(0, 100)}`);
+        const result = await this.execute(command, cwd, timeout);
+        this.reply(conn, id, result.result, result.error);
+        return;
+      }
+      case "sandbox/readFile": {
+        const { path, maxBytes } = params;
+        try {
+          const fd = await import("node:fs").then((fs) =>
+            fs.promises.open(path, "r"),
+          );
+          const buf = Buffer.alloc(Math.max(0, Math.min(maxBytes ?? 65536, 64 * 1024 * 1024)));
+          const { bytesRead } = await fd.read(buf, 0, buf.length, 0);
+          await fd.close();
+          this.reply(conn, id, {
+            contentBase64: buf.subarray(0, bytesRead).toString("base64"),
+          });
+        } catch {
+          this.reply(conn, id, { contentBase64: null });
+        }
+        return;
+      }
+      case "tools/call":
+        // Tool bridge pending: v0 has no caller tools declared.
+        this.reply(conn, id, undefined, {
+          message: "vibe-shim: tool bridge not implemented in this version",
+        });
+        return;
+      default:
+        this.reply(conn, id, undefined, { code: -32601, message: `unknown method ${method}` });
+    }
+  }
+
+  private execute(
+    command: string,
+    cwd: string,
+    timeout: number | null,
+  ): Promise<{ result?: unknown; error?: unknown }> {
+    return new Promise((resolve) => {
+      const proc = spawn("sh", ["-c", command], {
+        cwd: cwd && cwd !== "/" ? cwd : undefined,
+      });
+      let out = "";
+      let err = "";
+      let killed = false;
+      const timer =
+        timeout && timeout > 0
+          ? setTimeout(() => {
+              killed = true;
+              proc.kill("SIGKILL");
+              resolve({
+                error: { code: -32001, message: `command timed out after ${timeout}s` },
+              });
+            }, timeout * 1000)
+          : null;
+      proc.stdout!.setEncoding("utf8");
+      proc.stderr!.setEncoding("utf8");
+      proc.stdout!.on("data", (d: string) => (out += d));
+      proc.stderr!.on("data", (d: string) => (err += d));
+      proc.once("exit", (code) => {
+        if (killed) return; // already replied with the timeout error
+        if (timer) clearTimeout(timer);
+        resolve({
+          result: {
+            exitCode: code ?? -1,
+            stdout: out,
+            stderr: err,
+          },
+        });
+      });
+      proc.once("error", (e) => {
+        if (timer) clearTimeout(timer);
+        resolve({ error: { code: -32000, message: e.message } });
+      });
+    });
+  }
+}
