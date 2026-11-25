@@ -35,12 +35,6 @@ separately. Run some traffic through the shim, then check which one moved.
 
 Be clear-eyed about this before you build on it:
 
-- **No tool-calling bridge.** If your client sends `tools` in the request,
-  the shim logs a warning and runs the turn without them. You get a chat
-  partner through this endpoint, not an acting agent — it cannot edit
-  files or run commands *via your harness's tool system* yet. (Vibe's own
-  tools still run for its own purposes, like reading project context —
-  your harness just can't hand it its own tools yet.)
 - **Linux and macOS only.** Vibe's own docs say so explicitly: both
   `run-server` and `--agent-socket` are "not supported on Windows (exit
   1)". This isn't a shim limitation, it's upstream. A Windows build would
@@ -51,11 +45,13 @@ Be clear-eyed about this before you build on it:
   go away without notice." Expect breakage on `vibe` upgrades; pin a
   version if that matters to you.
 - **Streaming is fake.** The HTTP response streams as SSE, but it's the
-  full reply in one chunk at the end of the run — `vibe`'s own run only
-  reports a result once it finishes, there's no token-level stream from
-  the engine today.
-- **No conversation state.** Each request flattens the whole message
-  history into one prompt; there's no session resume across requests yet.
+  full reply (or the tool-call batch) emitted once the segment finishes —
+  `vibe`'s own run only reports a result once it finishes, there's no
+  token-level stream from the engine today.
+- **No session resume across turns.** Within a single tool-calling turn,
+  the live Vibe run stays parked while your client executes tools and
+  resumes when tool results arrive; across separate user turns, each new
+  request still flattens the message history into one prompt.
 
 If any of this doesn't fit your use case, wait or send a PR.
 
@@ -63,27 +59,35 @@ If any of this doesn't fit your use case, wait or send a PR.
 
 ```
 your client (OpenCode, Zed, curl...)
-  │  POST /v1/chat/completions  (OpenAI Chat Completions shape)
+  │  POST /v1/chat/completions  (OpenAI Chat Completions shape, optional tools)
   ▼
 vibe-shim (:8126, node:http)
-  │  flattens the message history into one prompt
+  │  creates a per-run Unix agent socket (/tmp/vibe-shim-<uid>/<hex>.sock)
+  │  declares the client's OpenAI tools in agent/initialize (namespace: client)
   ▼
 vibe run-server (long-lived child process, JSON-RPC over stdio)
-  │  run/start → spawns an app-server, assigns the run an agent socket
+  │  run/start → spawns an app-server, assigns the run its agent socket
   ▼
-vibe-shim's agent socket (Unix socket, sandbox passthrough)
-  │  sandbox/execute, sandbox/readFile: the engine's own tool calls,
-  │  run on your host exactly like plain `vibe -p` would
+vibe-shim's per-run agent socket (Unix socket, sandbox + client tools)
+  │  sandbox/execute, sandbox/readFile: host passthrough for Vibe's own setup
+  │  tools/call: parked in-memory while vibe waits for the reply; shim batches
+  │    parallel calls (~200ms) and responds to the HTTP client with
+  │    finish_reason: "tool_calls" (JSON or SSE deltas)
   ▼
-vibe engine executes the turn — its own system prompt, project context,
-AGENTS.md, skills — and talks to chat.mistral.ai with your plan's auth
-  │
+client executes the tools and sends a follow-up request with role: "tool"
+  │  shim matches trailing tool_call_ids to the parked run, answers the
+  │  pending tools/call RPCs, and continues waiting for the next tool batch
+  │  or run/ended (unmatched/expired IDs fall back to a fresh flattened run)
   ▼
-run/ended notification → shim reads export.json + the session's
-generations/*/checkpoint.json for the reply
+run/ended notification → shim closes the socket and reads export.json +
+session/generations/*/checkpoint.json for the final reply
   ▼
 OpenAI-shaped JSON (or minimal SSE) back to your client
 ```
+
+Parked runs live up to 30 minutes (TTL) and are aborted if the HTTP client
+disconnects mid-segment. Passing `tool_choice: "none"` or omitting `tools`
+runs without declaring any client tools.
 
 ## Prerequisites
 
@@ -141,7 +145,7 @@ In `opencode.jsonc` / `opencode.json`:
           "modelID": "mistral-large-4-0-3",
           "name": "Mistral Large 4.0.3",
           "limit": { "context": 1048576, "output": 128000 },
-          "capabilities": { "tools": false, "input": ["text"] }
+          "capabilities": { "tools": true, "input": ["text"] }
         }
       }
     }
@@ -163,7 +167,7 @@ In `settings.json`, under `language_models.openai_compatible`:
         "name": "mistral-large-4-0-3",
         "display_name": "Mistral Large 4.0.3",
         "max_tokens": 128000,
-        "capabilities": { "tools": false, "chat_completions": true }
+        "capabilities": { "tools": true, "chat_completions": true }
       }
     ]
   }
@@ -179,7 +183,7 @@ real catalog — paste it directly.)
 | --- | --- |
 | `GET /health` | `{status, provider, engine}` |
 | `GET /v1/models` | Your account's real model aliases, discovered at startup |
-| `POST /v1/chat/completions` | OpenAI Chat Completions shape; `stream: true` gets a 3-event SSE (role, full content, stop) |
+| `POST /v1/chat/completions` | OpenAI Chat Completions shape with client tool bridge (parked runs); `stream: true` emits SSE chunks for text or `tool_calls` deltas |
 
 `model` in the request is forwarded as `config.active_model` for the run,
 if it matches a discovered alias; otherwise the shim logs it and falls back
@@ -196,12 +200,9 @@ logs (including every `sandbox/execute` the engine ran) are at
 
 ## Roadmap
 
-1. Tool-calling bridge: declare the client's tools in the agent socket
-   handshake, route `tools/call` back to the client, handle the
-   parked-turn/resume dance for results that arrive on the next request.
-2. Real token streaming (today: one chunk at the end).
-3. Session resume across requests instead of flattening history each time.
-4. A Windows-compatible mode: plain `vibe -p` per request, no socket, no
+1. Real token streaming (today: one chunk per segment).
+2. Session resume across separate user turns instead of flattening history each time.
+3. A Windows-compatible mode: plain `vibe -p` per request, no socket, no
    run-server (loses the "hibernating" long-lived process, keeps the
    billing property).
 

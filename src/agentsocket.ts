@@ -1,7 +1,26 @@
 import net from "node:net";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, chmodSync } from "node:fs";
-import { dirname } from "node:path";
+import { mkdirSync, chmodSync, unlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { randomBytes } from "node:crypto";
+
+export interface AgentToolDefinition {
+  namespace: string;
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  modelAccess: "direct" | "programmatic" | "both";
+}
+
+export interface PendingToolCall {
+  callbackId: string;
+  toolCallId: string;
+  name: string; // raw "<namespace>.<name>" from vibe
+  input: unknown;
+  reply: (result: { output?: unknown; error?: { message: string; code?: string } }) => void;
+}
+
+const TOOL_TIMEOUT_SECONDS = 3600;
 
 /** Resolve a Python >= 3.9 interpreter for Vibe's tool helper. */
 function resolvePython(): string {
@@ -18,24 +37,52 @@ function resolvePython(): string {
   return "python3";
 }
 
+const RESOLVED_PYTHON = resolvePython();
+
+export function createRunSocketPath(): string {
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const dir = `/tmp/vibe-shim-${uid}`;
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  chmodSync(dir, 0o700);
+  return join(dir, `${randomBytes(4).toString("hex")}.sock`);
+}
+
+export interface AgentSocketOptions {
+  socketPath?: string;
+  workspace: string;
+  log: (line: string) => void;
+  python?: string;
+  tools?: AgentToolDefinition[];
+  onToolCall?: (call: PendingToolCall) => void;
+}
+
 /**
- * The agent socket the vibe engine connects to for every run. Serves a
- * passthrough sandbox (vibe's own tools run on this host, like the CLI) and,
- * later, the caller's tools via tools/call. One connection per request: one
- * line in, one line out, compact JSON-RPC with camelCase fields.
+ * Per-run agent socket the vibe engine connects to. Serves a passthrough
+ * sandbox (vibe's own tools run on this host, like the CLI) and the caller's
+ * declared tools via tools/call. One connection per request: one line in,
+ * one line out, compact JSON-RPC with camelCase fields.
  */
 export class AgentSocketServer {
   private server: net.Server | null = null;
+  private closed = false;
+  readonly socketPath: string;
+  private readonly workspace: string;
+  private readonly log: (line: string) => void;
+  private readonly python: string;
+  private readonly tools: AgentToolDefinition[];
+  private readonly onToolCall?: (call: PendingToolCall) => void;
 
-  constructor(
-    private readonly socketPath: string,
-    private readonly workspace: string,
-    private readonly log: (line: string) => void,
-    private readonly python: string = resolvePython(),
-  ) {}
+  constructor(opts: AgentSocketOptions) {
+    this.socketPath = opts.socketPath ?? createRunSocketPath();
+    this.workspace = opts.workspace;
+    this.log = opts.log;
+    this.python = opts.python ?? RESOLVED_PYTHON;
+    this.tools = opts.tools ?? [];
+    this.onToolCall = opts.onToolCall;
+  }
 
   listen(): Promise<string> {
-    mkdirSync(dirname(this.socketPath), { recursive: true });
+    mkdirSync(dirname(this.socketPath), { recursive: true, mode: 0o700 });
     chmodSync(dirname(this.socketPath), 0o700);
     const server = net.createServer({ allowHalfOpen: true }, (conn) =>
       this.handle(conn),
@@ -51,13 +98,22 @@ export class AgentSocketServer {
   }
 
   async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
     const server = this.server;
-    if (!server) return;
-    await new Promise<void>((resolve) => server.close(() => resolve()));
     this.server = null;
+    if (server) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    try {
+      unlinkSync(this.socketPath);
+    } catch {
+      /* already removed */
+    }
   }
 
   private reply(conn: net.Socket, id: unknown, result?: unknown, error?: unknown): void {
+    if (conn.destroyed || conn.writableEnded) return;
     const msg: Record<string, unknown> = { jsonrpc: "2.0", id };
     if (error !== undefined) msg.error = error;
     else msg.result = result ?? {};
@@ -93,13 +149,19 @@ export class AgentSocketServer {
   private async dispatch(conn: net.Socket, req: any): Promise<void> {
     const { method, params, id } = req;
     switch (method) {
-      case "agent/initialize":
-        this.reply(conn, id, {
+      case "agent/initialize": {
+        const result: Record<string, unknown> = {
           protocolVersion: 2,
           workspace: this.workspace,
           python: this.python,
-        });
+        };
+        if (this.tools.length > 0) {
+          result.tools = this.tools;
+          result.toolTimeoutSeconds = TOOL_TIMEOUT_SECONDS;
+        }
+        this.reply(conn, id, result);
         return;
+      }
       case "sandbox/execute": {
         const { command, cwd, timeout } = params;
         this.log(`sandbox/execute: ${String(command).slice(0, 100)}`);
@@ -124,12 +186,32 @@ export class AgentSocketServer {
         }
         return;
       }
-      case "tools/call":
-        // Tool bridge pending: v0 has no caller tools declared.
-        this.reply(conn, id, undefined, {
-          message: "vibe-shim: tool bridge not implemented in this version",
+      case "tools/call": {
+        if (!this.onToolCall) {
+          this.reply(conn, id, {
+            error: { message: "vibe-shim: no tool handler registered for this run" },
+          });
+          return;
+        }
+        const callbackId = String(params?.callbackId ?? "");
+        const name = String(params?.name ?? "");
+        const toolCallId = String(params?.toolCallId ?? callbackId);
+        const input = params?.input ?? {};
+        let answered = false;
+        const replyFn = (res: { output?: unknown; error?: { message: string; code?: string } }) => {
+          if (answered) return;
+          answered = true;
+          this.reply(conn, id, res);
+        };
+        this.onToolCall({
+          callbackId,
+          toolCallId,
+          name,
+          input,
+          reply: replyFn,
         });
         return;
+      }
       default:
         this.reply(conn, id, undefined, { code: -32601, message: `unknown method ${method}` });
     }

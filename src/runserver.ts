@@ -109,10 +109,9 @@ export class VibeRunServer {
     }
   }
 
-  /** Start a run; resolves when its run/ended notification arrives. */
-  async startRun(params: StartRunParams): Promise<RunEndedParams> {
-    await this.request("run/start", params); // answers at once, {} on ok
-    return new Promise<RunEndedParams>((resolve, reject) => {
+  /** Start a run; resolves once run/start is accepted, returning the run/ended promise wrapped in an object. */
+  async launchRun(params: StartRunParams): Promise<{ ended: Promise<RunEndedParams> }> {
+    const ended = new Promise<RunEndedParams>((resolve, reject) => {
       this.runs.set(params.runId, resolve);
       const proc = this.proc;
       if (proc) {
@@ -123,6 +122,20 @@ export class VibeRunServer {
         });
       }
     });
+    ended.catch(() => {});
+    try {
+      await this.request("run/start", params);
+    } catch (err) {
+      this.runs.delete(params.runId);
+      throw err;
+    }
+    return { ended };
+  }
+
+  /** Start a run; resolves when its run/ended notification arrives. */
+  async startRun(params: StartRunParams): Promise<RunEndedParams> {
+    const { ended } = await this.launchRun(params);
+    return ended;
   }
 
   async stopRun(runId: string): Promise<void> {

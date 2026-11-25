@@ -6,17 +6,35 @@ import { randomUUID } from "node:crypto";
 export interface ChatMessage {
   role: string;
   content: string | Array<Record<string, unknown>> | null;
+  tool_call_id?: string;
+  tool_calls?: Array<{
+    id: string;
+    type: string;
+    function: { name: string; arguments: string };
+  }>;
+  name?: string;
   [key: string]: unknown;
+}
+
+export interface OpenAITool {
+  type?: string;
+  function?: {
+    name?: string;
+    description?: string;
+    parameters?: Record<string, unknown>;
+  };
 }
 
 export interface ChatCompletionRequest {
   model: string;
   messages: ChatMessage[];
   stream?: boolean;
+  tools?: OpenAITool[];
+  tool_choice?: string | Record<string, unknown>;
   [key: string]: unknown;
 }
 
-function contentToText(content: ChatMessage["content"]): string {
+export function contentToText(content: ChatMessage["content"]): string {
   if (content === null || content === undefined) return "";
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return String(content);
@@ -136,6 +154,37 @@ export function readRunResult(outputDir: string): CompletionResult {
     throw new Error("run journal has no assistant output");
   }
   return { text, exportInfo };
+}
+
+export interface OpenAIToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+}
+
+export function toolCallsToJson(
+  req: ChatCompletionRequest,
+  toolCalls: OpenAIToolCall[],
+  sessionModel: string | null,
+): Record<string, unknown> {
+  return {
+    id: "chatcmpl-" + randomUUID().replace(/-/g, "").slice(0, 24),
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: req.model || sessionModel || "vibe",
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: null, tool_calls: toolCalls },
+        finish_reason: "tool_calls",
+      },
+    ],
+    usage: {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+    },
+  };
 }
 
 export function completionToJson(

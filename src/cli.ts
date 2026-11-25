@@ -3,7 +3,6 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { createShimServer } from "./server";
 import { VibeRunServer } from "./runserver";
-import { AgentSocketServer } from "./agentsocket";
 import { discoverModels } from "./models";
 
 function main(): void {
@@ -54,7 +53,7 @@ function main(): void {
               display_name: m.displayName,
               max_tokens: 128000,
               capabilities: {
-                tools: false,
+                tools: true,
                 images: false,
                 parallel_tool_calls: false,
                 prompt_cache_key: false,
@@ -91,7 +90,6 @@ function main(): void {
     opts.get("workspace") || process.env.VIBE_SHIM_WORKSPACE || process.cwd();
   const runsDir = join(logDir, "runs");
   mkdirSync(runsDir, { recursive: true });
-  const socketPath = join(logDir, "agent.sock");
 
   const runServer = new VibeRunServer();
   runServer.onStderr((chunk) => {
@@ -100,16 +98,10 @@ function main(): void {
     }
   });
 
-  const agentSocket = new AgentSocketServer(socketPath, workspace, (line) =>
-    log(`[agent-socket] ${line}`),
-  );
-
   void (async () => {
-    await agentSocket.listen();
-    log(`agent socket em ${socketPath} (workspace ${workspace})`);
     await runServer.start();
-    log("vibe run-server no ar");
-    const server = createShimServer(runServer, agentSocket, socketPath, {
+    log(`vibe run-server no ar (workspace ${workspace})`);
+    const server = createShimServer(runServer, {
       port,
       workspace,
       stateDir,
@@ -124,7 +116,6 @@ function main(): void {
       log("encerrando…");
       server.close();
       await runServer.stop();
-      await agentSocket.close();
       process.exit(0);
     };
     process.on("SIGINT", () => void shutdown());
