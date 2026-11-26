@@ -1,6 +1,6 @@
 import http from "node:http";
-import { randomUUID } from "node:crypto";
-import { mkdirSync, existsSync } from "node:fs";
+import { randomUUID, createHash } from "node:crypto";
+import { mkdirSync, existsSync, rmSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { VibeRunServer, RunEndedParams } from "./runserver";
 import {
@@ -12,6 +12,7 @@ import { discoverModels, VibeModel } from "./models";
 import {
   ChatCompletionRequest,
   ChatMessage,
+  LegacyOpenAIFunction,
   OpenAITool,
   OpenAIToolCall,
   computePrompt,
@@ -27,13 +28,17 @@ export interface ServerOptions {
   stateDir: string;
   runsDir: string;
   log: (line: string) => void;
+  batchWindowMs?: number;
+  catalog?: VibeModel[];
 }
 
 const RUN_TIMEOUT_MS = 10 * 60 * 1000;
 const PARKED_TTL_MS = 30 * 60 * 1000;
-const TOOL_BATCH_WINDOW_MS = 200;
+const DEFAULT_TOOL_BATCH_WINDOW_MS = 200;
+const STALE_RUN_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const MAX_TOOL_NAME_LEN = 64;
 
-interface ToolMapping {
+export interface ToolMapping {
   definitions: AgentToolDefinition[];
   reverseNames: Map<string, string>; // sanitized name -> original OpenAI tool name
 }
@@ -45,49 +50,258 @@ const reservedToolNames = new Set([
   "bash", "edit", "read", "write", "read_file", "write_file", "search_replace",
   "grep", "glob", "ls", "skill", "sleep", "wait", "task", "todo", "web_fetch",
   "web_search", "ask_user_question", "sign_in",
+  "run_typescript", "search_tool_functions", "list_processes", "read_process_output",
+  "stop_process", "send_process_input",
 ]);
 const CONFLICT_RE = /direct tool name "([^"]+)" conflicts with a built-in tool/;
 
-function sanitizeToolName(name: string): string {
+export function sanitizeToolName(name: string): string {
   let clean = name.replace(/[^A-Za-z0-9_$]/g, "_");
   if (!clean) clean = "_";
   if (/^[0-9]/.test(clean)) clean = `_${clean}`;
+  if (clean.length > MAX_TOOL_NAME_LEN) {
+    const hash = createHash("sha256").update(name).digest("hex").slice(0, 8);
+    clean = `${clean.slice(0, MAX_TOOL_NAME_LEN - 9)}_${hash}`;
+  }
   return clean;
 }
 
-function normalizeParameters(params: unknown): Record<string, unknown> {
-  if (params && typeof params === "object" && !Array.isArray(params)) {
-    const obj = params as Record<string, unknown>;
-    if (Object.keys(obj).length > 0) return obj;
+function resolveJsonPointer(root: unknown, pointer: string): unknown {
+  if (!pointer.startsWith("#")) return undefined;
+  const path = pointer.slice(1);
+  if (!path) return root;
+  if (!path.startsWith("/")) return undefined;
+  let cur: unknown = root;
+  for (const seg of path.slice(1).split("/")) {
+    const key = seg.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (cur && typeof cur === "object" && !Array.isArray(cur) && key in (cur as Record<string, unknown>)) {
+      cur = (cur as Record<string, unknown>)[key];
+    } else {
+      return undefined;
+    }
   }
-  return { type: "object", properties: {} };
+  return cur;
 }
 
-function mapOpenAITools(tools: OpenAITool[] | undefined, toolChoice: unknown): ToolMapping {
+function topLevelSchemaTypes(
+  root: unknown,
+  node: unknown,
+  reading: Set<string>,
+  depth: number,
+): string[] | null {
+  if (!node || typeof node !== "object" || Array.isArray(node)) return null;
+  const obj = node as Record<string, unknown>;
+  if (typeof obj.$ref === "string") {
+    const ref = obj.$ref;
+    if (!ref.startsWith("#") || reading.has(ref) || depth >= 32) return null;
+    const target = resolveJsonPointer(root, ref);
+    if (target === undefined) return null;
+    reading.add(ref);
+    const res = topLevelSchemaTypes(root, target, reading, depth + 1);
+    reading.delete(ref);
+    return res;
+  }
+
+  let types: string[] | null = null;
+  if (typeof obj.type === "string") {
+    types = [obj.type];
+  } else if (Array.isArray(obj.type) && obj.type.length > 0) {
+    types = obj.type.map((t) => (typeof t === "string" ? t : ""));
+  }
+
+  for (const kw of ["anyOf", "oneOf"] as const) {
+    const branches = obj[kw];
+    if (!Array.isArray(branches) || branches.length === 0) continue;
+    const union: string[] = [];
+    let allTyped = true;
+    for (const branch of branches) {
+      const found = topLevelSchemaTypes(root, branch, reading, depth + 1);
+      if (!found) {
+        allTyped = false;
+        break;
+      }
+      union.push(...found);
+    }
+    if (!allTyped) continue;
+    if (types) {
+      types = types.filter((t) => union.includes(t));
+    } else {
+      types = union;
+    }
+  }
+
+  if (!types) return null;
+  return Array.from(new Set(types)).sort();
+}
+
+export function normalizeParameters(params: unknown): Record<string, unknown> {
+  if (!params || typeof params !== "object" || Array.isArray(params)) {
+    return { type: "object", properties: {} };
+  }
+  const obj = params as Record<string, unknown>;
+  if (Object.keys(obj).length === 0) {
+    return { type: "object", properties: {} };
+  }
+
+  // Handle nullable/multi-type top-level object like type: ["object", "null"]
+  if (Array.isArray(obj.type)) {
+    const copy: Record<string, unknown> = { ...obj };
+    if (copy.type && Array.isArray(copy.type) && copy.type.includes("object")) {
+      copy.type = "object";
+      if (!copy.properties || typeof copy.properties !== "object") {
+        copy.properties = {};
+      }
+      return normalizeParameters(copy);
+    }
+  }
+
+  // Resolve top-level $ref if it points to a local object schema; otherwise wrap/fallback.
+  if (typeof obj.$ref === "string") {
+    const resolved = resolveJsonPointer(obj, obj.$ref);
+    if (resolved && typeof resolved === "object" && !Array.isArray(resolved)) {
+      const defs: Record<string, unknown> = {};
+      if (obj.$defs && typeof obj.$defs === "object") defs.$defs = obj.$defs;
+      if (obj.definitions && typeof obj.definitions === "object") defs.definitions = obj.definitions;
+      const merged = { ...(resolved as Record<string, unknown>), ...defs };
+      const types = topLevelSchemaTypes(merged, merged, new Set(["#"]), 0);
+      if (types && types.length === 1 && types[0] === "object") {
+        return merged;
+      }
+    }
+    return { type: "object", properties: { value: obj } };
+  }
+
+  // Check if the engine's top-level object check would reject this schema.
+  const types = topLevelSchemaTypes(obj, obj, new Set(["#"]), 0);
+  if (types === null) {
+    // Untyped schema (e.g. only properties or anyOf with untyped branch): force type: object
+    // while keeping properties if present; drop top-level anyOf/oneOf that might confuse providers.
+    const hasProps = obj.properties && typeof obj.properties === "object" && !Array.isArray(obj.properties);
+    if (hasProps && !obj.anyOf && !obj.oneOf) {
+      return { ...obj, type: "object" };
+    }
+    if (obj.anyOf || obj.oneOf) {
+      return { type: "object", properties: { value: obj } };
+    }
+    return { type: "object", properties: {}, ...obj };
+  }
+  if (types.length === 1 && types[0] === "object") {
+    if (obj.type === "object" && !obj.anyOf && !obj.oneOf) return obj;
+    if (obj.anyOf || obj.oneOf) {
+      const branches = (obj.anyOf ?? obj.oneOf) as unknown[];
+      const mergedProps: Record<string, unknown> = {};
+      for (const b of branches) {
+        if (b && typeof b === "object" && !Array.isArray(b)) {
+          const bp = (b as Record<string, unknown>).properties;
+          if (bp && typeof bp === "object" && !Array.isArray(bp)) {
+            Object.assign(mergedProps, bp);
+          }
+        }
+      }
+      const { anyOf: _a, oneOf: _o, ...rest } = obj;
+      const existingProps =
+        rest.properties && typeof rest.properties === "object" && !Array.isArray(rest.properties)
+          ? (rest.properties as Record<string, unknown>)
+          : {};
+      return { ...rest, type: "object", properties: { ...mergedProps, ...existingProps } };
+    }
+    return { ...obj, type: "object" };
+  }
+
+  // Top-level type is not solely "object" (e.g. "string", "array", ["string","null"], anyOf string|object).
+  // Wrap as an object schema so the engine never rejects the run.
+  return {
+    type: "object",
+    properties: { value: obj },
+  };
+}
+
+function resolveToolChoice(
+  toolChoice: unknown,
+  functionCall: unknown,
+): { mode: "none" | "auto" | "required" | "named"; name?: string } {
+  const raw = toolChoice !== undefined ? toolChoice : functionCall;
+  if (raw === "none") return { mode: "none" };
+  if (raw === "required") return { mode: "required" };
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const obj = raw as Record<string, unknown>;
+    if (obj.type === "function" && obj.function && typeof obj.function === "object") {
+      const name = (obj.function as Record<string, unknown>).name;
+      if (typeof name === "string" && name) return { mode: "named", name };
+    }
+    if (typeof obj.name === "string" && obj.name) {
+      return { mode: "named", name: obj.name };
+    }
+  }
+  return { mode: "auto" };
+}
+
+export function mapOpenAITools(
+  tools: OpenAITool[] | undefined,
+  toolChoice: unknown,
+  functions?: LegacyOpenAIFunction[],
+  functionCall?: unknown,
+): ToolMapping {
   const definitions: AgentToolDefinition[] = [];
   const reverseNames = new Map<string, string>();
-  if (!Array.isArray(tools) || tools.length === 0 || toolChoice === "none") {
+  const choice = resolveToolChoice(toolChoice, functionCall);
+  if (choice.mode === "none") {
     return { definitions, reverseNames };
   }
+
+  const normalized: Array<{ name: string; description: string; parameters: unknown }> = [];
+  if (Array.isArray(tools) && tools.length > 0) {
+    for (const t of tools) {
+      if (!t || typeof t !== "object") continue;
+      if (t.type && t.type !== "function") continue;
+      const fn = t.function && typeof t.function === "object" ? t.function : t;
+      const origName = fn?.name;
+      if (!origName || typeof origName !== "string") continue;
+      normalized.push({
+        name: origName,
+        description: typeof fn.description === "string" ? fn.description : "",
+        parameters: fn.parameters,
+      });
+    }
+  } else if (Array.isArray(functions) && functions.length > 0) {
+    for (const f of functions) {
+      if (!f || typeof f !== "object") continue;
+      if (!f.name || typeof f.name !== "string") continue;
+      normalized.push({
+        name: f.name,
+        description: typeof f.description === "string" ? f.description : "",
+        parameters: f.parameters,
+      });
+    }
+  }
+
+  if (normalized.length === 0) {
+    return { definitions, reverseNames };
+  }
+
   const used = new Set<string>();
-  for (const t of tools) {
-    if (t?.type && t.type !== "function") continue;
-    const origName = t?.function?.name;
-    if (!origName || typeof origName !== "string") continue;
-    let base = sanitizeToolName(origName);
-    if (reservedToolNames.has(base)) base = `client_${base}`;
+  for (const item of normalized) {
+    let base = sanitizeToolName(item.name);
+    if (reservedToolNames.has(base)) {
+      base = `client_${base}`;
+      if (base.length > MAX_TOOL_NAME_LEN) {
+        const hash = createHash("sha256").update(item.name).digest("hex").slice(0, 8);
+        base = `${base.slice(0, MAX_TOOL_NAME_LEN - 9)}_${hash}`;
+      }
+    }
     let safeName = base;
     let suffix = 2;
-    while (used.has(safeName)) {
-      safeName = `${base}_${suffix++}`;
+    while (used.has(safeName) || reservedToolNames.has(safeName)) {
+      const s = `_${suffix++}`;
+      safeName = `${base.slice(0, MAX_TOOL_NAME_LEN - s.length)}${s}`;
     }
     used.add(safeName);
-    reverseNames.set(safeName, origName);
+    reverseNames.set(safeName, item.name);
     definitions.push({
       namespace: "client",
       name: safeName,
-      description: typeof t.function?.description === "string" ? t.function.description : "",
-      inputSchema: normalizeParameters(t.function?.parameters),
+      description: item.description,
+      inputSchema: normalizeParameters(item.parameters),
       modelAccess: "direct",
     });
   }
@@ -124,6 +338,44 @@ function trailingToolMessages(messages: ChatMessage[]): ChatMessage[] {
   return out.reverse();
 }
 
+function shouldKeepRuns(): boolean {
+  return process.env.VIBE_SHIM_KEEP_RUNS === "1";
+}
+
+function cleanupRunDir(dir: string): void {
+  if (shouldKeepRuns()) return;
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch {
+    /* best effort */
+  }
+}
+
+export function sweepStaleRuns(runsDir: string, log?: (line: string) => void): void {
+  if (shouldKeepRuns() || !existsSync(runsDir)) return;
+  const cutoff = Date.now() - STALE_RUN_MAX_AGE_MS;
+  let removed = 0;
+  try {
+    for (const entry of readdirSync(runsDir)) {
+      const full = join(runsDir, entry);
+      try {
+        const st = statSync(full);
+        if (st.mtimeMs < cutoff) {
+          rmSync(full, { recursive: true, force: true });
+          removed++;
+        }
+      } catch {
+        /* ignore individual entry errors */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  if (removed > 0) {
+    log?.(`swept ${removed} stale run dir(s) from ${runsDir}`);
+  }
+}
+
 interface ParkedRun {
   runId: string;
   outputDir: string;
@@ -135,7 +387,9 @@ interface ParkedRun {
   createdAt: number;
   ttlTimer: ReturnType<typeof setTimeout> | null;
   cleanedUp: boolean;
+  inFlight: boolean;
   // Batch queue for arriving tools/call requests while waiting on a segment
+  // or while the run is parked awaiting tool results.
   incomingQueue: PendingToolCall[];
   onIncoming: (() => void) | null;
 }
@@ -148,12 +402,19 @@ export function createShimServer(
   runServer: VibeRunServer,
   opts: ServerOptions,
 ): http.Server {
+  const batchWindowMs = opts.batchWindowMs ?? DEFAULT_TOOL_BATCH_WINDOW_MS;
+  sweepStaleRuns(opts.runsDir, opts.log);
+
   let catalog: VibeModel[] = [];
-  try {
-    catalog = discoverModels();
-    opts.log(`catálogo descoberto: ${catalog.map((m) => m.alias).join(", ")}`);
-  } catch (err: any) {
-    opts.log(`falha ao descobrir catálogo: ${err.message}`);
+  if (opts.catalog) {
+    catalog = opts.catalog;
+  } else {
+    try {
+      catalog = discoverModels();
+      opts.log(`catálogo descoberto: ${catalog.map((m) => m.alias).join(", ")}`);
+    } catch (err: any) {
+      opts.log(`falha ao descobrir catálogo: ${err.message}`);
+    }
   }
   const defaultAlias = catalog[0]?.alias;
 
@@ -187,22 +448,26 @@ export function createShimServer(
   async function abortRun(run: ParkedRun, reason: string): Promise<void> {
     if (run.cleanedUp) return;
     run.cleanedUp = true;
+    run.inFlight = false;
     clearTtl(run);
     unindexRun(run);
     activeRuns.delete(run);
     failAllPending(run, reason);
     await runServer.stopRun(run.runId);
     await run.socket.close();
+    cleanupRunDir(run.outputDir);
   }
 
-  async function finishRun(run: ParkedRun): Promise<void> {
+  async function finishRun(run: ParkedRun, removeDir = true): Promise<void> {
     if (run.cleanedUp) return;
     run.cleanedUp = true;
+    run.inFlight = false;
     clearTtl(run);
     unindexRun(run);
     activeRuns.delete(run);
     failAllPending(run, "run ended");
     await run.socket.close();
+    if (removeDir) cleanupRunDir(run.outputDir);
   }
 
   function armTtl(run: ParkedRun): void {
@@ -233,10 +498,13 @@ export function createShimServer(
       };
       const schedule = () => {
         if (resolved || batchTimer) return;
-        batchTimer = setTimeout(flush, TOOL_BATCH_WINDOW_MS);
+        batchTimer = setTimeout(flush, batchWindowMs);
       };
       run.onIncoming = schedule;
       if (run.incomingQueue.length > 0) {
+        // Calls that arrived while the run was parked are already waiting;
+        // wait briefly in case sibling calls arrive in the same burst, then
+        // deliver them as the next batch.
         schedule();
       }
     });
@@ -282,11 +550,20 @@ export function createShimServer(
     if (trailing.length === 0) return null;
     for (const msg of trailing) {
       const hit = parkedByToolId.get(msg.tool_call_id!);
-      if (hit && !hit.cleanedUp) {
+      if (hit && !hit.cleanedUp && !hit.inFlight) {
         return { run: hit, trailing };
       }
     }
     return null;
+  }
+
+  function hasInFlightToolIds(messages: ChatMessage[]): boolean {
+    const trailing = trailingToolMessages(messages);
+    for (const msg of trailing) {
+      const hit = parkedByToolId.get(msg.tool_call_id!);
+      if (hit && !hit.cleanedUp && hit.inFlight) return true;
+    }
+    return false;
   }
 
   async function startNewRun(body: ChatCompletionRequest): Promise<ParkedRun> {
@@ -295,7 +572,18 @@ export function createShimServer(
     const outputDir = join(opts.runsDir, runId);
     mkdirSync(outputDir, { recursive: true });
 
-    const { definitions, reverseNames } = mapOpenAITools(body.tools, body.tool_choice);
+    const { definitions, reverseNames } = mapOpenAITools(
+      body.tools,
+      body.tool_choice,
+      body.functions,
+      body.function_call,
+    );
+    const choice = resolveToolChoice(body.tool_choice, body.function_call);
+    if (choice.mode === "required" || choice.mode === "named") {
+      opts.log(
+        `tool_choice=${choice.mode}${choice.name ? `(${choice.name})` : ""} is not enforced by vibe engine; proceeding with all declared tools`,
+      );
+    }
 
     const config: Record<string, unknown> = {};
     const knownAliases = new Set(catalog.map((m) => m.alias));
@@ -306,13 +594,30 @@ export function createShimServer(
       config.active_model = defaultAlias;
     }
 
+    const earlyQueue: PendingToolCall[] = [];
     let runRef: ParkedRun | null = null;
     const socket = new AgentSocketServer({
       workspace: opts.workspace,
       log: (line) => opts.log(`[agent-socket:${runId.slice(0, 8)}] ${line}`),
       tools: definitions,
       onToolCall: (call) => {
-        if (!runRef || runRef.cleanedUp) {
+        const bare = stripNamespace(call.name);
+        if (!reverseNames.has(bare)) {
+          opts.log(`tools/call for undeclared tool ${call.name} (${call.toolCallId}); returning error`);
+          call.reply({
+            error: {
+              message: `vibe-shim: undeclared tool "${call.name}"`,
+              code: "undeclared_tool",
+            },
+          });
+          return;
+        }
+        if (!runRef) {
+          opts.log(`tools/call ${call.name} (${call.toolCallId}) queued before launchRun resolved`);
+          earlyQueue.push(call);
+          return;
+        }
+        if (runRef.cleanedUp) {
           call.reply({ error: { message: "run no longer active" } });
           return;
         }
@@ -339,7 +644,11 @@ export function createShimServer(
       });
       endedPromise = launched.ended;
     } catch (err) {
+      for (const call of earlyQueue) {
+        call.reply({ error: { message: "run failed to start" } });
+      }
       await socket.close();
+      cleanupRunDir(outputDir);
       throw err;
     }
 
@@ -354,24 +663,30 @@ export function createShimServer(
       createdAt: Date.now(),
       ttlTimer: null,
       cleanedUp: false,
-      incomingQueue: [],
+      inFlight: true,
+      incomingQueue: earlyQueue,
       onIncoming: null,
     };
     runRef = run;
     activeRuns.add(run);
 
     // Ensure socket always closes if run ends unexpectedly while parked.
+    // While inFlight, runCompletion reads export.json before deleting outputDir.
     void endedPromise.then(
-      () => void finishRun(run),
-      () => void finishRun(run),
+      () => {
+        if (!run.inFlight) void finishRun(run, true);
+      },
+      () => {
+        if (!run.inFlight) void finishRun(run, true);
+      },
     );
 
     return run;
   }
 
   function resumeParkedRun(run: ParkedRun, trailing: ChatMessage[]): void {
+    run.inFlight = true;
     clearTtl(run);
-    unindexRun(run);
     const supplied = new Map<string, ChatMessage>();
     for (const msg of trailing) {
       if (msg.tool_call_id) supplied.set(msg.tool_call_id, msg);
@@ -392,6 +707,11 @@ export function createShimServer(
     res: http.ServerResponse,
   ): Promise<{ completion: Record<string, unknown>; finishReason: "stop" | "tool_calls" }> {
     const match = findParkedRun(body.messages);
+    if (!match && hasInFlightToolIds(body.messages)) {
+      const err: any = new Error("duplicate request: tool call batch is already in flight");
+      err.statusCode = 409;
+      throw err;
+    }
     let run: ParkedRun;
     if (match) {
       run = match.run;
@@ -399,6 +719,12 @@ export function createShimServer(
       resumeParkedRun(run, match.trailing);
     } else {
       run = await startNewRun(body);
+    }
+
+    if (res.destroyed || res.writableEnded) {
+      opts.log(`client already disconnected; aborting run ${run.runId}`);
+      await abortRun(run, "client disconnected");
+      throw new Error("client disconnected");
     }
 
     let requestFinished = false;
@@ -412,11 +738,13 @@ export function createShimServer(
     try {
       const segment = await waitForSegment(run);
       if (segment.kind === "tool_calls") {
+        unindexRun(run);
         const calls = segment.calls;
         for (const call of calls) {
           run.pendingCalls.set(call.toolCallId, call);
           parkedByToolId.set(call.toolCallId, run);
         }
+        run.inFlight = false;
         armTtl(run);
         const formatted = formatToolCalls(run, calls);
         requestFinished = true;
@@ -426,26 +754,38 @@ export function createShimServer(
         };
       }
 
-      const ended = segment.ended;
-      await finishRun(run);
-      requestFinished = true;
-
-      const exportFile = join(run.outputDir, "export.json");
-      if (existsSync(exportFile)) {
-        try {
-          const { text, exportInfo } = readRunResult(run.outputDir);
-          return {
-            completion: completionToJson(body, text, exportInfo, run.model),
-            finishReason: "stop",
-          };
-        } catch (err: any) {
-          opts.log(`export read failed: ${err.message}`);
+      if (run.incomingQueue.length > 0) {
+        // Unlikely, but if a call arrived right before run/ended won the race,
+        // answer it cleanly before finalizing.
+        for (const call of run.incomingQueue.splice(0)) {
+          call.reply({ error: { message: "run ended" } });
         }
       }
-      const message =
-        ended.error?.message ||
-        `run ended as ${ended.outcome || "outcome=unknown"}`;
-      throw new Error(`vibe run: ${message}`);
+
+      const ended = segment.ended;
+      await finishRun(run, false);
+      requestFinished = true;
+
+      try {
+        const exportFile = join(run.outputDir, "export.json");
+        if (existsSync(exportFile)) {
+          try {
+            const { text, exportInfo } = readRunResult(run.outputDir);
+            return {
+              completion: completionToJson(body, text, exportInfo, run.model),
+              finishReason: "stop",
+            };
+          } catch (err: any) {
+            opts.log(`export read failed: ${err.message}`);
+          }
+        }
+        const message =
+          ended.error?.message ||
+          `run ended as ${ended.outcome || "outcome=unknown"}`;
+        throw new Error(`vibe run: ${message}`);
+      } finally {
+        cleanupRunDir(run.outputDir);
+      }
     } catch (err) {
       await abortRun(run, err instanceof Error ? err.message : "run failed");
       const conflict = err instanceof Error ? CONFLICT_RE.exec(err.message) : null;
@@ -474,6 +814,7 @@ export function createShimServer(
     res: http.ServerResponse,
     completion: Record<string, any>,
     finishReason: "stop" | "tool_calls",
+    includeUsage: boolean,
   ): void {
     res.writeHead(200, {
       "content-type": "text/event-stream",
@@ -517,6 +858,20 @@ export function createShimServer(
     } else {
       res.write(chunk({ content: message.content }, null));
       res.write(chunk({}, "stop"));
+    }
+    if (includeUsage && completion.usage) {
+      res.write(
+        "data: " +
+          JSON.stringify({
+            id: completion.id,
+            object: "chat.completion.chunk",
+            created: completion.created,
+            model: completion.model,
+            choices: [],
+            usage: completion.usage,
+          }) +
+          "\n\n",
+      );
     }
     res.write("data: [DONE]\n\n");
     res.end();
@@ -565,14 +920,21 @@ export function createShimServer(
           const { completion, finishReason } = await runCompletion(body, res);
           if (res.writableEnded || res.destroyed) return;
           if (body.stream) {
-            writeSseCompletion(res, completion, finishReason);
+            const includeUsage = Boolean(
+              body.stream_options &&
+                typeof body.stream_options === "object" &&
+                (body.stream_options as Record<string, unknown>).include_usage,
+            );
+            writeSseCompletion(res, completion, finishReason, includeUsage);
           } else {
             send(res, 200, completion);
           }
         } catch (err: any) {
           opts.log(`completion failed: ${err.message}`);
           if (!res.headersSent && !res.destroyed) {
-            send(res, 502, { error: { message: err.message, type: "upstream_error" } });
+            const status = typeof err?.statusCode === "number" ? err.statusCode : 502;
+            const type = status === 409 ? "conflict_error" : "upstream_error";
+            send(res, status, { error: { message: err.message, type } });
           }
         }
       });
