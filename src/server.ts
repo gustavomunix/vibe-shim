@@ -55,7 +55,41 @@ const reservedToolNames = new Set([
 ]);
 const CONFLICT_RE = /direct tool name "([^"]+)" conflicts with a built-in tool/;
 
-export function sanitizeToolName(name: string): string {
+export // The engine's own tools are always disabled here, so what only exists to
+// describe them (subagents, background processes, MCP, connectors, workspace
+// AGENTS.md) just costs prompt tokens (~11% measured).
+const LEAN_RUN_CONFIG: Record<string, unknown> = {
+  enable_background_processes: false,
+  enable_subagents: false,
+  enable_mcp: false,
+  enable_connectors: false,
+  include_project_context: false,
+};
+
+// VIBE_SHIM_RUN_CONFIG: JSON object merged over LEAN_RUN_CONFIG into every
+// run's `config` (the config.toml document as JSON), e.g. to restore a default:
+// {"enable_subagents":true}.
+let cachedRunConfig: Record<string, unknown> | undefined;
+function extraRunConfig(): Record<string, unknown> {
+  if (cachedRunConfig) return cachedRunConfig;
+  const raw = process.env.VIBE_SHIM_RUN_CONFIG;
+  let parsed: unknown = {};
+  if (raw && raw.trim()) {
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err: any) {
+      throw new Error(`VIBE_SHIM_RUN_CONFIG is not valid JSON: ${err.message}`);
+    }
+  }
+  const overrides =
+    parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  cachedRunConfig = { ...LEAN_RUN_CONFIG, ...overrides };
+  return cachedRunConfig;
+}
+
+function sanitizeToolName(name: string): string {
   let clean = name.replace(/[^A-Za-z0-9_$]/g, "_");
   if (!clean) clean = "_";
   if (/^[0-9]/.test(clean)) clean = `_${clean}`;
@@ -585,7 +619,7 @@ export function createShimServer(
       );
     }
 
-    const config: Record<string, unknown> = {};
+    const config: Record<string, unknown> = { ...extraRunConfig() };
     const knownAliases = new Set(catalog.map((m) => m.alias));
     if (body.model && knownAliases.has(body.model)) {
       config.active_model = body.model;
