@@ -55,7 +55,7 @@ function main(): void {
               capabilities: {
                 tools: true,
                 images: false,
-                parallel_tool_calls: false,
+                parallel_tool_calls: true,
                 prompt_cache_key: false,
                 chat_completions: true,
                 interleaved_reasoning: false,
