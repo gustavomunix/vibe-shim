@@ -29,6 +29,11 @@ interface Pending {
   reject: (err: Error) => void;
 }
 
+interface ActiveRunWaiter {
+  resolve: (p: RunEndedParams) => void;
+  reject: (err: Error) => void;
+}
+
 /**
  * Manages the `vibe run-server` child process: JSON-RPC 2.0 over stdio,
  * one compact JSON message per line. `run/start` answers immediately; the
@@ -37,9 +42,11 @@ interface Pending {
  */
 export class VibeRunServer {
   private proc: ChildProcess | null = null;
+  private startPromise: Promise<void> | null = null;
+  private initialized = false;
   private nextId = 1;
   private readonly replies = new Map<number, Pending>();
-  private readonly runs = new Map<string, (p: RunEndedParams) => void>();
+  private readonly runs = new Map<string, ActiveRunWaiter>();
   private readonly stderrListeners: ((chunk: string) => void)[] = [];
 
   constructor(private readonly bin = process.env.VIBE_BIN || "vibe") {}
@@ -48,12 +55,37 @@ export class VibeRunServer {
     this.stderrListeners.push(fn);
   }
 
+  private isAlive(): boolean {
+    return this.proc !== null && this.proc.exitCode === null && this.proc.signalCode === null;
+  }
+
+  private rejectAll(reason: string): void {
+    const err = new Error(reason);
+    for (const pending of this.replies.values()) {
+      pending.reject(err);
+    }
+    this.replies.clear();
+    for (const waiter of this.runs.values()) {
+      waiter.reject(err);
+    }
+    this.runs.clear();
+  }
+
   async start(): Promise<void> {
-    if (this.proc && this.proc.exitCode === null) return;
+    if (this.isAlive() && this.initialized) return;
+    if (this.startPromise) return this.startPromise;
+    this.startPromise = this.spawnAndInitialize().finally(() => {
+      this.startPromise = null;
+    });
+    return this.startPromise;
+  }
+
+  private async spawnAndInitialize(): Promise<void> {
     const proc = spawn(this.bin, ["run-server"], {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.proc = proc;
+    this.initialized = false;
 
     proc.stdout!.setEncoding("utf8");
     const rl = createInterface({ input: proc.stdout! });
@@ -64,25 +96,66 @@ export class VibeRunServer {
       for (const fn of this.stderrListeners) fn(d);
     });
 
-    await this.request("initialize", {
+    const onDown = (reason: string) => {
+      rl.close();
+      if (this.proc === proc) {
+        this.proc = null;
+        this.initialized = false;
+      }
+      this.rejectAll(reason);
+    };
+
+    proc.once("exit", (code, signal) => {
+      const detail = signal ? `signal ${signal}` : `code ${code}`;
+      onDown(`vibe run-server exited (${detail})`);
+    });
+    proc.once("error", (err) => {
+      onDown(`vibe run-server error: ${err.message}`);
+    });
+
+    await this.sendRequest(proc, "initialize", {
       protocolVersion: 1,
       clientInfo: { name: "vibe-shim", version: "0.1.0" },
     });
+    if (this.proc === proc) {
+      this.initialized = true;
+    }
   }
 
-  /** Send a request and wait for the reply with the same id. */
-  private request(method: string, params: unknown): Promise<unknown> {
-    const proc = this.proc;
-    if (!proc || proc.exitCode !== null) {
+  /** Send a request to a specific child process without lazy restart. */
+  private sendRequest(proc: ChildProcess, method: string, params: unknown): Promise<unknown> {
+    if (proc.exitCode !== null || proc.signalCode !== null || !proc.stdin || proc.stdin.destroyed) {
       return Promise.reject(new Error("vibe run-server is not running"));
     }
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       this.replies.set(id, { resolve, reject });
-      proc.stdin!.write(
-        JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n",
-      );
+      try {
+        proc.stdin!.write(
+          JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n",
+          (err) => {
+            if (err && this.replies.delete(id)) {
+              reject(err);
+            }
+          },
+        );
+      } catch (err) {
+        this.replies.delete(id);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
     });
+  }
+
+  /** Send a request, lazily starting or restarting the child if needed. */
+  private async request(method: string, params: unknown): Promise<unknown> {
+    if (!this.isAlive() || !this.initialized) {
+      await this.start();
+    }
+    const proc = this.proc;
+    if (!proc || !this.isAlive()) {
+      throw new Error("vibe run-server is not running");
+    }
+    return this.sendRequest(proc, method, params);
   }
 
   private handleLine(line: string): void {
@@ -97,7 +170,7 @@ export class VibeRunServer {
       const waiter = this.runs.get(msg.params?.runId);
       if (waiter) {
         this.runs.delete(msg.params.runId);
-        waiter(msg.params as RunEndedParams);
+        waiter.resolve(msg.params as RunEndedParams);
       }
       return;
     }
@@ -111,16 +184,11 @@ export class VibeRunServer {
 
   /** Start a run; resolves once run/start is accepted, returning the run/ended promise wrapped in an object. */
   async launchRun(params: StartRunParams): Promise<{ ended: Promise<RunEndedParams> }> {
+    if (!this.isAlive() || !this.initialized) {
+      await this.start();
+    }
     const ended = new Promise<RunEndedParams>((resolve, reject) => {
-      this.runs.set(params.runId, resolve);
-      const proc = this.proc;
-      if (proc) {
-        proc.once("exit", () => {
-          if (this.runs.delete(params.runId)) {
-            reject(new Error("vibe run-server exited mid-run"));
-          }
-        });
-      }
+      this.runs.set(params.runId, { resolve, reject });
     });
     ended.catch(() => {});
     try {
@@ -139,8 +207,9 @@ export class VibeRunServer {
   }
 
   async stopRun(runId: string): Promise<void> {
+    if (!this.isAlive() || !this.initialized) return;
     try {
-      await this.request("run/stop", { runId });
+      await this.sendRequest(this.proc!, "run/stop", { runId });
     } catch {
       /* run already gone */
     }
@@ -148,12 +217,18 @@ export class VibeRunServer {
 
   async stop(): Promise<void> {
     const proc = this.proc;
-    if (!proc) return;
     this.proc = null;
+    this.initialized = false;
+    if (!proc) return;
     proc.stdin?.end();
+    if (proc.exitCode !== null || proc.signalCode !== null) return;
     await new Promise<void>((resolve) => {
       const t = setTimeout(() => {
-        proc.kill("SIGKILL");
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          /* already gone */
+        }
         resolve();
       }, 5000);
       proc.once("exit", () => {
