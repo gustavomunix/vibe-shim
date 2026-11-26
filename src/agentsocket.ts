@@ -1,6 +1,6 @@
 import net from "node:net";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, chmodSync, unlinkSync } from "node:fs";
+import { mkdirSync, chmodSync, unlinkSync, promises as fsPromises } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 
@@ -171,18 +171,24 @@ export class AgentSocketServer {
       }
       case "sandbox/readFile": {
         const { path, maxBytes } = params;
+        let fd: fsPromises.FileHandle | null = null;
         try {
-          const fd = await import("node:fs").then((fs) =>
-            fs.promises.open(path, "r"),
-          );
+          fd = await fsPromises.open(path, "r");
           const buf = Buffer.alloc(Math.max(0, Math.min(maxBytes ?? 65536, 64 * 1024 * 1024)));
           const { bytesRead } = await fd.read(buf, 0, buf.length, 0);
-          await fd.close();
           this.reply(conn, id, {
             contentBase64: buf.subarray(0, bytesRead).toString("base64"),
           });
         } catch {
           this.reply(conn, id, { contentBase64: null });
+        } finally {
+          if (fd) {
+            try {
+              await fd.close();
+            } catch {
+              /* best effort */
+            }
+          }
         }
         return;
       }
@@ -225,6 +231,7 @@ export class AgentSocketServer {
     return new Promise((resolve) => {
       const proc = spawn("sh", ["-c", command], {
         cwd: cwd && cwd !== "/" ? cwd : undefined,
+        detached: true,
       });
       let out = "";
       let err = "";
@@ -233,7 +240,19 @@ export class AgentSocketServer {
         timeout && timeout > 0
           ? setTimeout(() => {
               killed = true;
-              proc.kill("SIGKILL");
+              if (proc.pid) {
+                try {
+                  process.kill(-proc.pid, "SIGKILL");
+                } catch {
+                  try {
+                    proc.kill("SIGKILL");
+                  } catch {
+                    /* already gone */
+                  }
+                }
+              } else {
+                proc.kill("SIGKILL");
+              }
               resolve({
                 error: { code: -32001, message: `command timed out after ${timeout}s` },
               });
