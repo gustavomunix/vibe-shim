@@ -51,7 +51,20 @@ Be clear-eyed about this before you build on it:
 - **No session resume across turns.** Within a single tool-calling turn,
   the live Vibe run stays parked while your client executes tools and
   resumes when tool results arrive; across separate user turns, each new
-  request still flattens the message history into one prompt.
+  request still flattens the message history into one prompt (including
+  `<tool_call>` and `<tool_result>` blocks).
+- **`tool_choice` is advisory only (except `"none"`).** `"none"` disables
+  declaring client tools; `"required"` and `{type: "function", function:
+  {name}}` (and legacy `function_call`) are accepted without error, but
+  the Vibe engine does not enforce forcing a specific tool.
+- **Usage is reported on the final response.** Intermediate
+  `finish_reason: "tool_calls"` responses report zero usage because Vibe
+  writes usage only in `export.json` when the run finishes; the final
+  `finish_reason: "stop"` response reports the cumulative usage for the
+  whole multi-segment run (and emits a final usage SSE chunk when
+  `stream_options.include_usage` is set).
+- **No image input.** Image parts are replaced with `[image attached]`
+  placeholders; `cli.ts models` advertises `images: false`.
 
 If any of this doesn't fit your use case, wait or send a PR.
 
@@ -86,8 +99,31 @@ OpenAI-shaped JSON (or minimal SSE) back to your client
 ```
 
 Parked runs live up to 30 minutes (TTL) and are aborted if the HTTP client
-disconnects mid-segment. Passing `tool_choice: "none"` or omitting `tools`
-runs without declaring any client tools.
+disconnects mid-segment. Concurrent duplicate requests for an already
+in-flight tool batch receive `409 Conflict` instead of racing on the same
+run. Passing `tool_choice: "none"` (or legacy `function_call: "none"`) or
+omitting `tools`/`functions` runs without declaring any client tools.
+
+### Engine tools & client tool translation
+
+- **Engine built-in tools are disabled** (`enabledTools: ["__vibe_shim_none__"]`)
+  so the model calls your client's tools instead of Vibe's host tools.
+- **Reserved names and sanitization:** client tools whose names collide with
+  Vibe built-ins (`bash`, `edit`, `read`, `grep`, etc. — plus any name the
+  engine rejects at runtime) are declared under a `client_` prefix and mapped
+  back to the original tool name in `tool_calls`. Non-identifier characters,
+  leading digits, unicode, and names over 64 characters are sanitized with
+  stable uniqueness and mapped back transparently.
+- **Schema normalization:** Vibe requires every tool's top-level `inputSchema`
+  to be `"type": "object"`. Missing/empty schemas, `type: ["object", "null"]`,
+  top-level `$ref`, `anyOf`/`oneOf`, or primitive top-level schemas are
+  normalized (or wrapped under `{type: "object", properties: {value: ...}}`)
+  so the engine does not reject the run.
+- **Legacy fields:** OpenAI `tools` entries without `type` and legacy
+  `functions`/`function_call` fields are accepted.
+- **Child process recovery:** if `vibe run-server` crashes, in-flight HTTP
+  requests fail cleanly with `502` and the next request lazily restarts and
+  re-initializes `vibe run-server`.
 
 ## Prerequisites
 
@@ -191,10 +227,12 @@ to the account's first/default alias.
 
 ## Debugging
 
-Every run leaves its export and session journal under
+Run exports and session journals are written under
 `$XDG_STATE_HOME/zed-shims/vibe-shim/runs/<run-id>/` (or
-`~/.local/state/...` by default): `export.json` for outcome/usage/cost, and
-`session/generations/*/checkpoint.json` for the actual turn output. Shim
+`~/.local/state/...` by default) and deleted automatically once each run
+finishes or aborts (stale directories older than 24 hours are swept at
+startup). Set `VIBE_SHIM_KEEP_RUNS=1` to keep `export.json` and
+`session/generations/*/checkpoint.json` on disk for inspection. Shim
 logs (including every `sandbox/execute` the engine ran) are at
 `.../vibe-shim/shim.log`.
 
